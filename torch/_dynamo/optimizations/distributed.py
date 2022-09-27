@@ -89,13 +89,13 @@ class DDPOptimizer:
                 target = gm.get_submodule(node.target)
                 for name, p in target.named_parameters():
                     if p.requires_grad:
-                        buckets[0].size += p.storage().nbytes()
+                        buckets[0].size += p._storage().nbytes()
                         # TODO correct FQ name?
                         buckets[0].params.append(f"{node}_{name}")
             elif node.op == "get_attr":
                 maybe_param = getattr(gm, node.target)
                 if maybe_param.requires_grad:
-                    buckets[0].size += maybe_param.storage().nbytes()
+                    buckets[0].size += maybe_param._storage().nbytes()
                     buckets[0].params.append(node.target)
 
             # All nodes have to be mapped to a bucket, even if they don't have their own params
