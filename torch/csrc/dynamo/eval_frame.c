@@ -252,12 +252,11 @@ static PyCodeObject* lookup(CacheEntry* e, PyFrameObject *frame, CacheEntry* pre
   }
   Py_DECREF(valid);
   if (valid == Py_True) {
-    CacheEntry* extra = get_extra(frame->f_code);
     // Keep the head as the most recently used cache entry.
     // If the hit cache entry is not the head of the linked list, 
     // move it to the head
-    if (e != extra) {
-        // prev cannot be NULL here
+    if (prev != NULL) {
+        CacheEntry* extra = get_extra(frame->f_code);
         prev->next = e->next;
         e->next = extra;
         set_extra(frame->f_code, e);
