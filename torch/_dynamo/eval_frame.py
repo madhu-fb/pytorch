@@ -6,6 +6,7 @@ import itertools
 import logging
 import os
 import sys
+import textwrap
 import threading
 import traceback
 import types
@@ -43,6 +44,59 @@ null_context = contextlib.nullcontext
 unset = object()
 compile_lock = threading.RLock()
 most_recent_backend = None
+
+
+class OptimizedModule(torch.nn.Module):
+    """
+    Wraps the original nn.Module object and later patches its
+    forward method to optimized self.forward method.
+    """
+
+    def __init__(self, mod):
+        super().__init__()
+        # Installs the params/buffer
+        self._mod = mod
+
+    # def __getattr__(self, name):
+    #     if name == "_mod":
+    #         return self._modules["_mod"]
+    #     return getattr(self._mod, name)
+
+    def forward(self, *args, **kwargs):
+        # This will be monkey patched later
+        raise RuntimeError("Should not be here")
+
+    # def __setattr__(self, name, value):
+    #     self.__dict__[name] = value
+
+    def __getattribute__(self, name):
+        if name == "_mod":
+            # return super(OptimizedModule, self).__getattribute__("_mod")
+            return object.__getattribute__(self, "_mod")
+        # if name == "_mod":
+        #     return super(OptimizedModule, self).__getattribute__("_mod")
+        #     return self._modules["_mod"]
+        mod = super(OptimizedModule, self).__getattribute__("_mod")
+        return mod.__getattr__(name)
+        # return super(OptimizedModule, self).__getattribute__(name)
+
+    # TODO - Remove all these methods and use __getattribute__ to redirect
+    # otherwise everything has a prefix _mod
+    # def parameters(self):
+    #     return self._mod.parameters()
+
+    # def buffers(self):
+    #     return self._mod.buffers()
+
+    # def named_parameters(self):
+    #     return self._mod.named_parameters()
+
+    # def named_buffers(self):
+    #     return self._mod.named_buffers()
+
+    # def __str__(self):
+    #     # the _torchdynamo_orig_callable pollutes the print
+    #     return self._mod.__str__()
 
 
 def remove_from_cache(f):
@@ -119,31 +173,43 @@ class _TorchDynamoContext:
         # Optimize the forward method of torch.nn.Module object
         if isinstance(fn, torch.nn.Module):
             mod = fn
-            optimized_forward = self(mod.forward)
-
-            class TorchDynamoNNModuleWrapper:
-                """
-                A wrapper that redirects the forward call to the optimized
-                forward, while for rest it redirects the calls to the original
-                module.
-                """
-
-                def __getattr__(self, name):
-                    return getattr(mod, name)
-
-                def forward(self, *args, **kwargs):
-                    return optimized_forward(*args, **kwargs)
-
-                def __call__(self, *args, **kwargs):
-                    return self.forward(*args, **kwargs)
-
-            new_mod = TorchDynamoNNModuleWrapper()
+            new_mod = OptimizedModule(mod)
+            new_mod.forward = self(mod.forward)
             # Save the function pointer to find the original callable while nesting
             # of decorators.
             new_mod._torchdynamo_orig_callable = mod
             return new_mod
 
         assert callable(fn)
+        if not (inspect.isfunction(fn) or inspect.ismethod(fn)):
+            raise RuntimeError(
+                textwrap.dedent(
+                    """
+
+                    torch._dynamo.optimize is called on a non function object.
+                    If this is a callable class, please optimize the individual methods that you are interested in optimizing.
+
+                    >> class CallableClass:
+                    >>     def __init__(self):
+                    >>         super().__init__()
+                    >>         self.relu = torch.nn.ReLU()
+                    >>
+                    >>     def __call__(self, x):
+                    >>         return self.relu(torch.sin(x))
+                    >>
+                    >>     def print_hello(self):
+                    >>         print("Hello world")
+                    >>
+                    >> mod = CallableClass()
+
+                    If you want to optimize the __call__ function
+
+                    >> mod.__call__ = torch._dynamo.optimize(mod.__call__)
+
+                    """
+                )
+            )
+
         callback = self.callback
         on_enter = self.on_enter
         backend_ctx_ctor = self.extra_ctx_ctor

@@ -904,6 +904,113 @@ class NNModuleTests(torch._dynamo.test_case.TestCase):
         self.assertTrue(torch._dynamo.testing.same(real, graph(rx)))
 
 
+class OptimizedModuleTest(torch._dynamo.test_case.TestCase):
+    def test_return_type(self):
+        class MockModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.r = torch.nn.ReLU()
+
+            def forward(self, x):
+                return self.r(torch.sin(x))
+
+        mod = MockModule()
+        opt_mod = torch._dynamo.optimize("eager")(mod)
+        self.assertIsInstance(opt_mod, torch._dynamo.OptimizedModule)
+
+        # Check that accessing attributes does not return the original module
+        opt_mod = opt_mod.to(device="cpu").to(dtype=torch.float64)
+        self.assertIsInstance(opt_mod, torch._dynamo.OptimizedModule)
+
+    def test_attr(self):
+        class MockModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(10, 10)
+                self.register_buffer("buf0", torch.randn(10, 10))
+
+            def forward(self, x):
+                return self.r(torch.sin(x)) + self.buf0
+
+        mod = MockModule()
+        opt_mod = torch._dynamo.optimize("eager")(mod)
+
+        for (p1, p2) in zip(mod.parameters(), opt_mod.parameters()):
+            self.assertTrue(id(p1) == id(p2))
+
+        for (p1, p2) in zip(mod.named_parameters(), opt_mod.named_parameters()):
+            mod_param_name, mod_param = p1
+            opt_mod_param_name, opt_mod_param = p2
+            self.assertTrue(mod_param_name == opt_mod_param_name)
+            self.assertTrue(id(mod_param) == id(opt_mod_param))
+
+        for (p1, p2) in zip(mod.buffers(), opt_mod.buffers()):
+            self.assertTrue(id(p1) == id(p2))
+
+        for (p1, p2) in zip(mod.named_buffers(), opt_mod.named_buffers()):
+            mod_param_name, mod_param = p1
+            opt_mod_param_name, opt_mod_param = p2
+            self.assertTrue(mod_param_name == opt_mod_param_name)
+            self.assertTrue(id(mod_param) == id(opt_mod_param))
+
+    def test_recursion(self):
+        class MockModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.r = torch.nn.ReLU()
+
+            def forward(self, x):
+                return self.r(torch.sin(x))
+
+        mod = MockModule()
+        opt_mod = torch._dynamo.optimize("eager")(mod)
+
+        for _ in range(5):
+            opt_mod = torch._dynamo.optimize("eager")(opt_mod)
+
+        print(opt_mod)
+        for (p1, p2) in zip(mod.parameters(), opt_mod.parameters()):
+            self.assertTrue(id(p1) == id(p2))
+
+    def test_composed_nn_modules(self):
+        class MockModule1(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.r = torch.nn.ReLU()
+
+            def forward(self, x):
+                return self.r(torch.sin(x))
+
+        mod1 = MockModule1()
+        opt_mod1 = torch._dynamo.optimize("eager")(mod1)
+
+        class MockModule2(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mod = opt_mod1
+
+            def forward(self, x):
+                return self.mod(torch.cos(x))
+
+        mod2 = MockModule2()
+        opt_mod2 = torch._dynamo.optimize("eager")(mod2)
+        self.assertIsInstance(opt_mod2, torch._dynamo.OptimizedModule)
+
+        import logging
+        torch._dynamo.config.log_level = logging.DEBUG
+        opt_mod2(torch.randn(4))
+
+        assert False
+        # # Check that accessing attributes does not return the original module
+        # opt_mod = opt_mod.to(device="cpu").to(dtype=torch.float32)
+        # self.assertIsInstance(opt_mod, torch._dynamo.OptimizedModule)
+
+    # def test_recursion
+    # det test_from_lambda
+    # test other types of callables
+    # def test hooks
+
+
 if __name__ == "__main__":
     from torch._dynamo.test_case import run_tests
 
