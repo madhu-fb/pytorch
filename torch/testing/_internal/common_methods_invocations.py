@@ -17646,6 +17646,14 @@ python_ref_db = [
             DecorateInfo(unittest.skip('Overflow when downcasting signed type is undefined'), 'TestCommon', 'test_compare_cpu'),
         )
     ),
+    ElementwiseBinaryPythonRefInfo(
+        "_refs._conversions.complex",
+        torch_opinfo_name="complex",
+        skips=(
+            # Test doesn't account for complex's type promotion semantics
+            DecorateInfo(unittest.expectedFailure, 'TestBinaryUfuncs', 'test_type_promotion'),
+        )
+    ),
     ElementwiseUnaryPythonRefInfo(
         "_refs._conversions.double",
         torch_opinfo_name="double",
