@@ -11,7 +11,10 @@ from torch.ao.quantization.backend_config import (
     DTypeWithConstraints,
 )
 from torch.ao.quantization.fake_quantize import FakeQuantizeBase
-from torch.ao.quantization.observer import ObserverBase
+from torch.ao.quantization.observer import (
+    FixedQParamsObserver,
+    ObserverBase,
+)
 from torch.ao.quantization.stubs import DeQuantStub
 from torch.ao.quantization.utils import (
     activation_is_statically_quantized,
@@ -951,6 +954,8 @@ def _qconfig_satisfies_dtype_config_constraints(
 
         1. QConfig specified a quantization range that falls within the backend's, if any
         2. QConfig specified a min scale value that is >= the backend's, if any
+        3. QConfig specified a FixedQParamsObserver or FixedQParamsFakeQuantize that has
+           scale and zero point that match the backend's, if any
 
     If `is_activation` is True, we check `qconfig.activation`, else we check `qconfig.weight`.
     If `qconfig` or `dtype_with_constraints.dtype` is None, or the dtypes do not match, return True.
@@ -968,6 +973,8 @@ def _qconfig_satisfies_dtype_config_constraints(
         backend_quant_min = dtype_with_constraints.quant_min_lower_bound
         backend_quant_max = dtype_with_constraints.quant_max_upper_bound
         backend_scale_min = dtype_with_constraints.scale_min_lower_bound
+        backend_fixed_scale = dtype_with_constraints.fixed_scale
+        backend_fixed_zero_point = dtype_with_constraints.fixed_zero_point
         # check quantization ranges
         if backend_quant_min is not None and backend_quant_max is not None:
             if app_quant_min is None or app_quant_max is None:
@@ -989,6 +996,13 @@ def _qconfig_satisfies_dtype_config_constraints(
                 warnings.warn(("QConfig %s eps (%s) must be greater than or equal to "
                               "the backend's min scale value (%s), ignoring %s") %
                               (debug_string, app_scale_min, backend_scale_min, qconfig))
+                return False
+        # check fixed scale and zero point
+        if backend_fixed_scale is not None and backend_fixed_zero_point is not None:
+            assert isinstance(observer, FixedQParamsObserver)
+            if observer.scale != backend_fixed_scale or observer.zero_point != backend_fixed_zero_point:
+                # TODO: throw an exception here?
+                warnings.warn("TODO(write this")
                 return False
         return True
 
