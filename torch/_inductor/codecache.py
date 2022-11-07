@@ -147,79 +147,177 @@ def is_gcc():
     return re.search(r"(gcc|g\+\+)", cpp_compiler())
 
 
-class _SupportedVecIsa(enum.Enum):
+class SupportedVecIsa(enum.Enum):
     AVX512 = 1
     AVX2 = 2
     INVALID = -1
 
     def __bool__(self):
-        return self != _SupportedVecIsa.INVALID
+        return self != SupportedVecIsa.INVALID
 
     @staticmethod
-    def isa_str(supported_isa: enum.Enum):
-        if supported_isa == _SupportedVecIsa.AVX512:
+    def isa_vec_bit_size(supported_isa: enum.Enum):
+        if supported_isa == SupportedVecIsa.AVX512:
+            return 512
+        elif supported_isa == SupportedVecIsa.AVX2:
+            return 256
+        else:
+            return 0
+
+    @staticmethod
+    def isa_vec_size(supported_isa: enum.Enum, dtype: torch.dtype = torch.float):
+        if supported_isa == SupportedVecIsa.AVX512:
+            if dtype == torch.float:
+                return 16
+            elif dtype == torch.bfloat16:
+                return 32
+            else:
+                raise NotImplementedError(
+                    f"Vectorization has not supported {dtype} yet"
+                )
+        elif supported_isa == SupportedVecIsa.AVX2:
+            if dtype == torch.float:
+                return 8
+            elif dtype == torch.bfloat16:
+                return 16
+            else:
+                raise NotImplementedError(
+                    f"Vectorization has not supported {dtype} yet"
+                )
+        else:
+            return 1
+
+    @staticmethod
+    def vec_size(dtype: torch.dtype = torch.float):
+        return SupportedVecIsa.isa_vec_size(supported_vector_isa(), dtype)
+
+    @staticmethod
+    def str(supported_isa: enum.Enum):
+        if supported_isa == SupportedVecIsa.AVX512:
             return "avx512"
-        elif supported_isa == _SupportedVecIsa.AVX2:
+        elif supported_isa == SupportedVecIsa.AVX2:
             return "avx2"
         else:
             return ""
 
     @staticmethod
     def vec_macro(supported_isa: enum.Enum):
-        if supported_isa == _SupportedVecIsa.AVX512:
+        if supported_isa == SupportedVecIsa.AVX512:
             return "CPU_CAPABILITY_AVX512"
-        elif supported_isa == _SupportedVecIsa.AVX2:
+        elif supported_isa == SupportedVecIsa.AVX2:
             return "CPU_CAPABILITY_AVX2"
         else:
             return ""
+
+    @staticmethod
+    def build_arch_flags(supported_isa: enum.Enum):
+        if supported_isa == SupportedVecIsa.AVX512:
+            return "-mavx512f -mavx512dq -mavx512vl -mavx512bw -mfma"
+        elif supported_isa == SupportedVecIsa.AVX2:
+            return "-mavx2 -mfma"
+        else:
+            return ""
+
+    @staticmethod
+    def candidates():
+        # TODO: Add ARM ISA here.
+        return [SupportedVecIsa.AVX512, SupportedVecIsa.AVX2]
 
 
 # Cache the cpuinfo to avoid I/O overhead. Meanwhile, the cpuinfo content
 # might have too much redundant content that is useless for ISA check. Hence,
 # we only cache some key isa information.
-@functools.lru_cache(1)
-def get_cpu_proc_info():
+@functools.lru_cache(None)
+def filter_out_valid_isa():
     if sys.platform != "linux":
         return []
+
+    AVX_CODE = """
+#if defined(CPU_CAPABILITY_AVX512) || defined(CPU_CAPABILITY_AVX2)
+#include <ATen/cpu/vec/functional.h>
+#include <ATen/cpu/vec/vec.h>
+#endif
+
+__attribute__((aligned(64))) float in_out_ptr0[16] = {0.0};
+
+int main() {
+    auto tmp0 = at::vec::Vectorized<float>(1);
+    auto tmp1 = tmp0.exp();
+    tmp1.store(in_out_ptr0);
+    return 0;
+}
+"""
+
+    def is_legal_isa(isa: SupportedVecIsa):
+        key, input_path = write(AVX_CODE, "cpp", extra="")
+        from filelock import FileLock
+
+        lock_dir = get_lock_dir()
+        lock = FileLock(os.path.join(lock_dir, key + ".lock"), timeout=LOCK_TIMEOUT)
+        with lock:
+            output_path = input_path[:-3] + "isa_chk"
+            build_cmd = cpp_compile_command(
+                input_path, output_path, warning_all=False, shared=False, valid_isa=isa
+            ).split(" ")
+            try:
+                subprocess.check_output(build_cmd, stderr=subprocess.STDOUT)
+
+                env = dict(os.environ)
+                lpaths = cpp_extension.library_paths() + [
+                    sysconfig.get_config_var("LIBDIR")
+                ]
+                env["LD_LIBRARY_PATH"] = ":".join(lpaths)
+                subprocess.check_call(build_cmd, stderr=subprocess.STDOUT, env=env)
+            except Exception as e:
+                return False
+
+            return True
 
     isa_info = []
     with open("/proc/cpuinfo") as _cpu_info:
         _cpu_info_content = _cpu_info.read()
-        if _SupportedVecIsa.isa_str(_SupportedVecIsa.AVX512) in _cpu_info_content:
-            isa_info.append(_SupportedVecIsa.AVX512)
-
-        if _SupportedVecIsa.isa_str(_SupportedVecIsa.AVX2) in _cpu_info_content:
-            isa_info.append(_SupportedVecIsa.AVX2)
-
+        for cur_isa in SupportedVecIsa.candidates():
+            if SupportedVecIsa.str(cur_isa) in _cpu_info_content and is_legal_isa(
+                cur_isa
+            ):
+                isa_info.append(cur_isa)
         return isa_info
 
 
 def supported_vector_isa():
-    # TODO: Add ARM Vec here.
-    # Dict(k: isa, v: number of float element)
-    vec_isa_info = {
-        _SupportedVecIsa.AVX512: 16,
-        _SupportedVecIsa.AVX2: 8,
-    }
+    valid_isa_vec = filter_out_valid_isa()
+    if not valid_isa_vec:
+        return SupportedVecIsa.INVALID
 
-    if config.cpp.simdlen is None or config.cpp.simdlen <= 1:
-        return _SupportedVecIsa.INVALID
+    # If the simdlen is None, it indicates determin the vectroization length automatically
+    if config.cpp.simdlen is None:
+        assert valid_isa_vec
+        return valid_isa_vec[0]
 
-    cpu_info_content = get_cpu_proc_info()
-    for isa in vec_isa_info.keys():
-        if isa in cpu_info_content and config.cpp.simdlen == vec_isa_info[isa]:
+    # If the simdlen is less that, it indicates to disable the vectorization.
+    if config.cpp.simdlen <= 1:
+        return SupportedVecIsa.INVALID
+
+    for isa in valid_isa_vec:
+        if config.cpp.simdlen == SupportedVecIsa.isa_vec_bit_size(isa):
             return isa
 
-    return _SupportedVecIsa.INVALID
+    return SupportedVecIsa.INVALID
 
 
-def cpp_compile_command(input, output, include_pytorch=False):
-    valid_isa = supported_vector_isa()
+def cpp_compile_command(
+    input,
+    output,
+    warning_all=True,
+    shared=True,
+    include_pytorch=False,
+    valid_isa: SupportedVecIsa = SupportedVecIsa.INVALID,
+):
     if include_pytorch or valid_isa:
         ipaths = cpp_extension.include_paths() + [sysconfig.get_path("include")]
         lpaths = cpp_extension.library_paths() + [sysconfig.get_config_var("LIBDIR")]
         libs = ["c10", "torch", "torch_cpu", "torch_python", "gomp"]
-        macros = _SupportedVecIsa.vec_macro(valid_isa)
+        macros = SupportedVecIsa.vec_macro(valid_isa)
         if macros:
             macros = f"-D{macros}"
     else:
@@ -235,11 +333,13 @@ def cpp_compile_command(input, output, include_pytorch=False):
     lpaths = " ".join(["-L" + p for p in lpaths])
     libs = " ".join(["-l" + p for p in libs])
 
+    shared_lib = "-shared -fPIC" if shared else ""
+    warning_all_flag = "-Wall" if warning_all else ""
     return re.sub(
         r"[ \n]+",
         " ",
         f"""
-            {cpp_compiler()} {input} -shared -fPIC -Wall -std=c++14 -Wno-unused-variable
+            {cpp_compiler()} {input} {shared_lib} {warning_all_flag} -std=c++14 -Wno-unused-variable
             {ipaths} {lpaths} {libs} {macros}
             -march=native -O3 -ffast-math -fno-finite-math-only -fopenmp
             -o{output}
@@ -253,7 +353,10 @@ class CppCodeCache:
 
     @classmethod
     def load(cls, source_code):
-        key, input_path = write(source_code, "cpp", extra=cpp_compile_command("i", "o"))
+        valid_isa = supported_vector_isa()
+        key, input_path = write(
+            source_code, "cpp", extra=cpp_compile_command("i", "o", valid_isa=valid_isa)
+        )
         if key not in cls.cache:
             from filelock import FileLock
 
@@ -263,7 +366,7 @@ class CppCodeCache:
                 output_path = input_path[:-3] + "so"
                 if not os.path.exists(output_path):
                     cmd = cpp_compile_command(
-                        input=input_path, output=output_path
+                        input=input_path, output=output_path, valid_isa=valid_isa
                     ).split(" ")
                     try:
                         subprocess.check_output(cmd, stderr=subprocess.STDOUT)
